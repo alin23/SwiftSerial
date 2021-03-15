@@ -615,7 +615,7 @@ extension SerialPort {
                 return
             }
 
-            var parts = str.split(separator: "\n", omittingEmptySubsequences: false)
+            var parts = str.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
             guard parts.count > 1 else {
                 if parts.count == 1 {
                     line.append(str)
