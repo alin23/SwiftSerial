@@ -1,5 +1,82 @@
 import Foundation
 
+#if os(OSX)
+let POLLING_TIME: TimeInterval = 0.05
+let queue = DispatchQueue(label: "swiftserial.queue", qos: .userInteractive, attributes: [], autoreleaseFrequency: .workItem, target: nil)
+
+extension Calendar.Component {
+    var timeInterval: Double? {
+        switch self {
+        case .era:                      return nil
+        case .year:                     return (Calendar.Component.day.timeInterval! * 365.0)
+        case .month:                    return (Calendar.Component.minute.timeInterval! * 43800)
+        case .day:                      return 86400
+        case .hour:                     return 3600
+        case .minute:                   return 60
+        case .second:                   return 1
+        case .quarter:                  return (Calendar.Component.day.timeInterval! * 91.25)
+        case .weekOfMonth, .weekOfYear: return (Calendar.Component.day.timeInterval! * 7)
+        case .nanosecond:               return 1e-9
+        default:                        return nil
+        }
+    }
+}
+
+extension DateComponents {
+    static var allComponentsSet: Set<Calendar.Component> {
+        return [.era, .year, .month, .day, .hour, .minute,
+                .second, .weekday, .weekdayOrdinal, .quarter,
+                .weekOfMonth, .weekOfYear, .yearForWeekOfYear,
+                .nanosecond, .calendar, .timeZone]
+    }
+
+    internal static let allComponents: [Calendar.Component] =  [.nanosecond, .second, .minute, .hour,
+                                                                .day, .month, .year, .yearForWeekOfYear,
+                                                                .weekOfYear, .weekday, .quarter, .weekdayOrdinal,
+                                                                .weekOfMonth]
+
+    var timeInterval: TimeInterval {
+        var totalAmount: TimeInterval = 0
+        DateComponents.allComponents.forEach {
+            if let multipler = $0.timeInterval, let value = value(for: $0), value != Int(NSDateComponentUndefined) {
+                totalAmount += (TimeInterval(value) * multipler)
+            }
+        }
+        return totalAmount
+    }
+}
+
+func runInThread(timeout: TimeInterval, _ action: @escaping () -> Void) -> DispatchTimeoutResult {
+    let semaphore = DispatchSemaphore(value: 0)
+    let thread = Thread {
+        action()
+        semaphore.signal()
+    }
+    thread.start()
+
+    let result = semaphore.wait(timeout: DispatchTime.now() + timeout)
+    if result == .timedOut {
+        thread.cancel()
+    }
+
+    return result
+}
+
+func runAsync(timeout: TimeInterval, _ action: @escaping () -> Void) -> DispatchTimeoutResult {
+    let task = DispatchWorkItem {
+        action()
+    }
+    queue.async(execute: task)
+
+    let result = task.wait(timeout: DispatchTime.now() + timeout)
+    if result == .timedOut {
+        task.cancel()
+    }
+
+    return result
+}
+#endif
+
 #if os(Linux)
 public enum BaudRate {
     case baud0
@@ -211,22 +288,39 @@ public enum PortError: Int32, Error {
     case stringsMustBeUTF8
     case unableToConvertByteToCharacter
     case deviceNotConnected
+    case readTimeout
+    case failedToRead
 }
 
 public class SerialPort {
 
-    var path: String
-    var fileDescriptor: Int32?
+    public var path: String
+    public var async: Bool
+    public var openTimeout: TimeInterval?
+    public var readTimeout: TimeInterval?
+    public var fileDescriptor: Int32?
+    public var io: DispatchIO?
+    public var minimumBytesToRead: Int = 1
 
-    public init(path: String) {
+    public init(path: String, async: Bool = false, openTimeout: DateComponents? = nil, readTimeout: DateComponents? = nil) {
         self.path = path
+        self.async = async
+        self.openTimeout = openTimeout?.timeInterval
+        self.readTimeout = readTimeout?.timeInterval
     }
 
-    public func openPort() throws {
-        try openPort(toReceive: true, andTransmit: true)
+    func throwIfFailedToOpen(_ fileDescriptor: Int32?) throws {
+        // Throw error if open() failed
+        if fileDescriptor == nil || fileDescriptor == PortError.failedToOpen.rawValue {
+            throw PortError.failedToOpen
+        }
     }
 
-    public func openPort(toReceive receive: Bool, andTransmit transmit: Bool) throws {
+    public func openPort(timeout: DateComponents? = nil) throws {
+        try openPort(toReceive: true, andTransmit: true, timeout: timeout)
+    }
+
+    public func openPort(toReceive receive: Bool, andTransmit transmit: Bool, timeout: DateComponents? = nil) throws {
         guard !path.isEmpty else {
             throw PortError.invalidPath
         }
@@ -249,20 +343,38 @@ public class SerialPort {
 
     #if os(Linux)
         fileDescriptor = open(path, readWriteParam | O_NOCTTY)
+        try throwIfFailedToOpen(fileDescriptor)
     #elseif os(OSX)
-        fileDescriptor = open(path, readWriteParam | O_NOCTTY | O_EXLOCK)
-    #endif
+        guard async, let timeout = (timeout?.timeInterval ?? openTimeout), timeout > 0 else {
+            fileDescriptor = open(path, readWriteParam | O_NOCTTY | O_EXLOCK)
+            try throwIfFailedToOpen(fileDescriptor)
+            return
+        }
 
-        // Throw error if open() failed
-        if fileDescriptor == PortError.failedToOpen.rawValue {
+        io = DispatchIO(type: .stream, path: self.path, oflag: readWriteParam | O_NOCTTY | O_EXLOCK, mode: 0, queue: queue, cleanupHandler: {err in return})
+
+        guard let io = io else {
             throw PortError.failedToOpen
         }
+        io.read(offset: 0, length: 1, queue: queue, ioHandler: {(done, data, err) in return})
+
+        let maxTries = Int((timeout / POLLING_TIME).rounded())
+        for _ in 0..<maxTries {
+            if io.fileDescriptor > 0 {
+                break
+            }
+            Thread.sleep(forTimeInterval: POLLING_TIME)
+        }
+        try throwIfFailedToOpen(io.fileDescriptor)
+
+        fileDescriptor = io.fileDescriptor
+    #endif
     }
 
     public func setSettings(receiveRate: BaudRate,
                             transmitRate: BaudRate,
                             minimumBytesToRead: Int,
-                            timeout: Int = 0, /* 0 means wait indefinitely */
+                            timeout: TimeInterval = 0, /* 0 means wait indefinitely */
                             parityType: ParityType = .none,
                             sendTwoStopBits: Bool = false, /* 1 stop bit is the default */
                             dataBitsSize: DataBitsSize = .bits8,
@@ -351,8 +463,13 @@ public class SerialPort {
         var specialCharacters: specialCharactersTuple = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // NCCS = 20
     #endif
 
+        self.minimumBytesToRead = minimumBytesToRead
+        if timeout > 0 {
+            self.readTimeout = timeout
+        }
+
         specialCharacters.VMIN = cc_t(minimumBytesToRead)
-        specialCharacters.VTIME = cc_t(timeout)
+        specialCharacters.VTIME = cc_t((timeout * 10).rounded())
         settings.c_cc = specialCharacters
 
         // Commit settings
@@ -360,6 +477,13 @@ public class SerialPort {
     }
 
     public func closePort() {
+        if let io = io {
+            io.close(flags: .stop)
+            self.io = nil
+            self.fileDescriptor = nil
+            return
+        }
+
         if let fileDescriptor = fileDescriptor {
             close(fileDescriptor)
         }
@@ -457,7 +581,58 @@ extension SerialPort {
 
     public func readLine() throws -> String {
         let newlineChar = CChar(10) // Newline/Line feed character `\n` is 10
-        return try readUntilChar(newlineChar)
+        guard let timeout = self.readTimeout, timeout > 0 else {
+            return try readUntilChar(newlineChar)
+        }
+
+        var line: String? = nil
+        switch runAsync(timeout: timeout, { [weak self] in
+            line = try? self?.readUntilChar(newlineChar)
+        }) {
+            case .timedOut:
+                throw PortError.readTimeout
+            case .success:
+                guard let line = line else {
+                    throw PortError.failedToRead
+                }
+                return line
+        }
+    }
+
+    public func readLines(_ handler: @escaping ((String) -> Void)) {
+        guard let io = io else {
+            return
+        }
+
+        var line = ""
+        io.setLimit(lowWater: minimumBytesToRead)
+        io.read(offset: 0, length: Int.max, queue: queue, ioHandler: {(done, dispatchData, error) in
+            if done, (dispatchData == nil || dispatchData!.isEmpty), error == 0 {
+                return
+            }
+
+            guard let data = dispatchData, !data.isEmpty, let str = String(data: Data(data), encoding: .utf8) else {
+                return
+            }
+
+            var parts = str.split(separator: "\n", omittingEmptySubsequences: false)
+            guard parts.count > 1 else {
+                if parts.count == 1 {
+                    line.append(str)
+                }
+                return
+            }
+
+            line.append(contentsOf: parts.removeFirst())
+            handler(line)
+
+            let lastPart = parts.popLast()!
+            for part in parts {
+                handler(String(part))
+            }
+
+            line = String(lastPart)
+        })
     }
 
     public func readByte() throws -> UInt8 {
