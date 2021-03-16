@@ -365,6 +365,9 @@ public class SerialPort {
             }
             Thread.sleep(forTimeInterval: POLLING_TIME)
         }
+        if io.fileDescriptor <= 0 {
+            io.close(flags: .stop)
+        }
         try throwIfFailedToOpen(io.fileDescriptor)
 
         fileDescriptor = io.fileDescriptor
