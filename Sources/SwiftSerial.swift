@@ -558,6 +558,10 @@ extension SerialPort {
         while true {
             let bytesRead = try readBytes(into: buffer, size: 1)
 
+            if bytesRead == -1 {
+                throw PortError.failedToRead
+            }
+
             if bytesRead > 0 {
                 if ( buffer[0] > 127) {
                     throw PortError.unableToConvertByteToCharacter
