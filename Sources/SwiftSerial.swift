@@ -374,6 +374,15 @@ public class SerialPort {
     #endif
     }
 
+    public func hasValidFileDescriptor() -> Bool {
+        guard let fd = fileDescriptor, fd > 0 else {
+            return false
+        }
+        
+        errno = 0
+        return fcntl(fd, F_GETFD) != -1 || errno != EBADF
+    }
+
     public func setSettings(receiveRate: BaudRate,
                             transmitRate: BaudRate,
                             minimumBytesToRead: Int,
